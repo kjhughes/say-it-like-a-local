@@ -1,0 +1,93 @@
+name: Publish pronunciation update
+on:
+  push:
+    paths:
+      - ".github/workflows/publish-pronunciation.yml"
+      - "pronunciation-entries.json"
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency:
+  group: publish-pronunciation
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Generate entries and push
+        run: |
+          set -euo pipefail
+          pip install --quiet gTTS
+          python3 <<'PY'
+          import re, json, base64, sys, time, os
+          from gtts import gTTS
+          EMBEDDED = [
+           ("Marché des Enfants Rouges","Paris's oldest covered market (3rd arr.)","Marché des Enfants Rouges"),
+           ("LULU Crêperie","The gourmet cheese-crust galette stall — from the video","Lulu Crêperie"),
+           ("Chez Alain Miam Miam","The legendary galette stall ('miam miam' = yum-yum)","Chez Alain Miam Miam"),
+           ("Galette","Savory buckwheat crêpe","galette"),
+           ("Crêpe","Thin pancake — savory or sweet","crêpe"),
+           ("Sarrasin","Buckwheat — naturally gluten-free","sarrasin"),
+           ("Dentelle de fromage","'Cheese lace' — the crispy fried-cheese crust","dentelle de fromage"),
+           ("Cornet","Cone — how the galette is rolled","cornet"),
+           ("Immersion Vendôme","Tuesday breakfast spot near the hotel","Immersion Vendôme"),
+           ("Au P'tit Grec","Monday cheese-cone fallback (rue Mouffetard)","Au P'tit Grec"),
+           ("Rue de Bretagne","LULU / the market's street","rue de Bretagne"),
+           ("Sans gluten","'Gluten-free' — handy at the counter for Karen","sans gluten"),
+          ]
+          group = "Paris"; lang = "fr"; NEW = EMBEDDED
+          if os.path.exists("pronunciation-entries.json"):
+              j = json.load(open("pronunciation-entries.json", encoding="utf-8"))
+              group = j.get("group", group); lang = j.get("lang", lang)
+              NEW = [(e["name"], e["note"], e.get("tts", e["name"])) for e in j["entries"]]
+          h = open('index.html', encoding='utf-8').read()
+          m = re.search(r'const DATA = (\[.*\]);', h, re.S)
+          data = json.loads(m.group(1))
+          gi = next(i for i,g in enumerate(data) if g['group'] == group)
+          sec = data[gi]
+          have = {it['name'] for it in sec['items']}
+          todo = [t for t in NEW if t[0] not in have]
+          if not todo:
+              print("NOCHANGE"); sys.exit(0)
+          LANGLABEL = {"fr":"French","it":"Italian","es":"Spanish","ca":"Catalan"}.get(lang, lang)
+          esc = lambda s: s.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace("'","&#x27;")
+          start = len(sec['items']); rows = ""
+          for k,(name,note,tts) in enumerate(todo):
+              for attempt in range(3):
+                  try:
+                      gTTS(tts, lang=lang).save('/tmp/_clip.mp3'); break
+                  except Exception:
+                      if attempt == 2: raise
+                      time.sleep(3)
+              b = base64.b64encode(open('/tmp/_clip.mp3','rb').read()).decode()
+              sec['items'].append({"name":name,"note":note,"lang":lang,"audio":b})
+              i = start + k
+              rows += (f'<button class="row" data-g="{gi}" data-i="{i}" data-name="{esc(name.lower())}">\n'
+                '  <span class="play" aria-hidden="true">\n'
+                '    <svg viewBox="0 0 24 24" class="ic-play"><path d="M8 5v14l11-7z"/></svg>\n'
+                '    <svg viewBox="0 0 24 24" class="ic-pause"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>\n'
+                '  </span>\n'
+                f'  <span class="txt"><span class="nm">{esc(name)}</span><span class="nt">{esc(note)}</span></span>\n'
+                f'  <span class="lang">{LANGLABEL}</span>\n'
+                '</button>')
+          h = h[:m.start()] + "const DATA = " + json.dumps(data, ensure_ascii=False) + ";" + h[m.end():]
+          anchor = '</button></div>\n</section></div>'
+          idx = h.rfind(anchor)
+          assert idx != -1, "anchor not found"
+          h = h[:idx] + '</button>' + rows + '</div>\n</section></div>' + h[idx+len(anchor):]
+          open('index.html','w',encoding='utf-8').write(h)
+          print("ADDED", len(todo))
+          PY
+          if git diff --quiet; then
+            echo "No changes to publish."
+            exit 0
+          fi
+          git config user.name "Kenneth Hughes"
+          git config user.email "kjh@entel.com"
+          git add index.html
+          git commit -m "Add pronunciation entries via publish workflow"
+          git push
