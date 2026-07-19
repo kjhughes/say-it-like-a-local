@@ -1,0 +1,100 @@
+name: Patch audio player
+on:
+  push:
+    paths:
+      - ".github/workflows/patch-player.yml"
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency:
+  group: patch-player
+  cancel-in-progress: false
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch player and push
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          h = open('index.html', encoding='utf-8').read()
+          old = """let current = null; // {audio, row}
+          function stop() {
+            if (current) { current.audio.pause(); current.audio.currentTime = 0; current.row.classList.remove('on'); current = null; }
+          }
+          document.querySelectorAll('.row').forEach(row => {
+            row.addEventListener('click', () => {
+              const g = +row.dataset.g, i = +row.dataset.i;
+              if (current && current.row === row) { stop(); return; }
+              stop();
+              const b64 = DATA[g].items[i].audio;
+              const audio = new Audio('data:audio/mpeg;base64,' + b64);
+              audio.addEventListener('ended', stop);
+              row.classList.add('on');
+              current = {audio, row};
+              audio.play().catch(()=>{ row.classList.remove('on'); current=null; });
+            });
+          });"""
+          new = """let actx = null, current = null; // {src, row}
+          const bufCache = new Map(); // clips decoded + resampled once, then reused
+          function ctx() {
+            if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+            if (actx.state === 'suspended') actx.resume();
+            return actx;
+          }
+          document.addEventListener('pointerdown', () => { ctx(); }, {once: true}); // warm the output stream on first interaction
+          function stop() {
+            if (current) { try { current.src.onended = null; current.src.stop(); } catch (e) {} current.row.classList.remove('on'); current = null; }
+          }
+          function bufferFor(g, i) {
+            const key = g + ':' + i;
+            if (!bufCache.has(key)) {
+              const bin = atob(DATA[g].items[i].audio);
+              const u8 = new Uint8Array(bin.length);
+              for (let j = 0; j < bin.length; j++) u8[j] = bin.charCodeAt(j);
+              bufCache.set(key, ctx().decodeAudioData(u8.buffer));
+            }
+            return bufCache.get(key);
+          }
+          document.querySelectorAll('.row').forEach(row => {
+            row.addEventListener('click', () => {
+              const g = +row.dataset.g, i = +row.dataset.i;
+              if (current && current.row === row) { stop(); return; }
+              stop();
+              const token = current = {src: null, row};
+              row.classList.add('on');
+              bufferFor(g, i).then(buf => {
+                if (current !== token) return;
+                const src = ctx().createBufferSource();
+                src.buffer = buf;
+                src.connect(ctx().destination);
+                src.onended = stop;
+                token.src = src;
+                src.start();
+              }).catch(() => {
+                bufCache.delete(g + ':' + i);
+                if (current === token) { row.classList.remove('on'); current = null; }
+              });
+            });
+          });"""
+          n = h.count(old)
+          if n == 0:
+              if 'createBufferSource' in h:
+                  print('Already patched.'); raise SystemExit(0)
+              raise SystemExit('ERROR: player block not found; aborting with no changes')
+          if n > 1:
+              raise SystemExit('ERROR: player block matched %d times; aborting' % n)
+          h = h.replace(old, new, 1)
+          open('index.html', 'w', encoding='utf-8').write(h)
+          print('Patched player.')
+          PY
+          if git diff --quiet; then
+            echo "No changes."
+            exit 0
+          fi
+          git config user.name "Kenneth Hughes"
+          git config user.email "kjh@entel.com"
+          git add index.html
+          git commit -m "Fix pronunciation player: persistent Web Audio pipeline"
+          git push
